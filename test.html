@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SSE 调试与查看器</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #12182b;
+      --text: #e6ebff;
+      --muted: #93a1c6;
+      --accent: #6ea8fe;
+      --ok: #3ddc97;
+      --err: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    h1 { font-size: 20px; margin: 0 0 16px; letter-spacing: .5px; }
+    .card {
+      background: var(--panel); border-radius: 16px; padding: 16px; box-shadow: 0 6px 18px rgb(0 0 0 / 30%);
+    }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; }
+    label { font-size: 12px; color: var(--muted); }
+    input[type="text"] {
+      width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #2a3458; background: #0e1530; color: var(--text);
+    }
+    button {
+      appearance: none; border: 0; padding: 10px 14px; border-radius: 12px; cursor: pointer; font-weight: 600; color: #0b1020;
+      background: var(--accent);
+    }
+    button.secondary { background: #2c365e; color: var(--text); }
+    button.danger { background: var(--err); color: white; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .status { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .dot { width: 10px; height: 10px; border-radius: 999px; background: #666; box-shadow: 0 0 0 2px #0003 inset; }
+    .dot.open { background: var(--ok); }
+    .dot.connecting { background: #f6c945; }
+    .dot.closed { background: var(--err); }
+
+    .options { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .options > * { display: inline-flex; align-items: center; gap: 6px; }
+
+    .log {
+      height: 56vh; margin-top: 12px; overflow: auto; border: 1px solid #263157; border-radius: 12px; background: #0a0f23; padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 13px; line-height: 1.5;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    .meta { color: #9bb0ff; }
+    .line { margin-bottom: 4px; }
+    .time { color: #86e1a1; }
+    .id { color: #f6c945; }
+    .evt { color: #ffb8e0; }
+    .sys { color: #6ea8fe; }
+    .err { color: var(--err); }
+    .muted { color: var(--muted); }
+
+    .footer { margin-top: 8px; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+  </style>
+</head>
+<body>
+  <h1>Server‑Sent Events 查看器</h1>
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="url">SSE 地址</label>
+        <input id="url" type="text" placeholder="例如：https://your-domain.com/sse" value="http://localhost:3000/sse" />
+</div>
+<div class="controls">
+<button id="connect">连接</button>
+<button id="disconnect" class="secondary" disabled>断开</button>
+<button id="clear" class="secondary">清屏</button>
+<button id="copy" class="secondary">复制日志</button>
+</div>
+</div>
+
+<div class="footer" style="margin-top:10px">
+<div class="status"><span class="dot closed" id="dot"></span><span id="state">未连接</span></div>
+      <div class="options">
+        <label><input type="checkbox" id="autoscroll" checked /> 自动滚动</label>
+        <label><input type="checkbox" id="showSystem" checked /> 显示系统消息</label>
+      </div>
+    </div>
+
+    <div id="log" class="log" aria-live="polite" aria-label="SSE 日志输出"></div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    const dotEl = $("dot");
+    const stateEl = $("state");
+
+    let es = null;
+    let connectedUrl = "";
+
+    function ts() {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    }
+
+    function setState(state) {
+      stateEl.textContent = state;
+      dotEl.classList.remove("open", "closed", "connecting");
+      if (state === "已连接") dotEl.classList.add("open");
+      else if (state === "连接中…") dotEl.classList.add("connecting");
+      else dotEl.classList.add("closed");
+    }
+
+    function printLine(html) {
+      const div = document.createElement("div");
+      div.className = "line";
+      div.innerHTML = html;
+      logEl.appendChild(div);
+      if ($("autoscroll").checked) {
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
+
+    function sys(msg, cls = "sys") {
+      if (!$("showSystem").checked) return;
+      printLine(`<span class="${cls}">[${ts()}]</span> <span class="muted">${msg}</span>`);
+    }
+
+    function connect() {
+      const url = $("url").value.trim();
+      if (!url) return alert("请输入 SSE 地址");
+
+      disconnect();
+      setState("连接中…");
+      sys(`→ 正在连接到 <span class="meta">${url}</span> ...`);
+
+      try {
+        es = new EventSource(url, { withCredentials: false });
+        connectedUrl = url;
+      } catch (e) {
+        setState("未连接");
+        sys(`创建 EventSource 失败：${e?.message || e}`, "err");
+        return;
+      }
+
+      $("connect").disabled = true;
+      $("disconnect").disabled = false;
+
+      es.addEventListener("open", () => {
+        setState("已连接");
+        sys("✔ 连接已建立（readyState=OPEN）");
+      });
+
+      es.addEventListener("message", (ev) => {
+        const time = `<span class="time">[${ts()}]</span>`;
+        const id = ev.lastEventId ? ` <span class="id">#${ev.lastEventId}</span>` : "";
+        const type = ev.type !== "message" ? ` <span class="evt">${ev.type}</span>` : "";
+        let data = ev.data;
+        // 尝试美化 JSON
+        try {
+          const parsed = JSON.parse(ev.data);
+          data = `<code>${escapeHtml(JSON.stringify(parsed, null, 2))}</code>`;
+        } catch (_) {
+          data = `<code>${escapeHtml(ev.data)}</code>`;
+        }
+        printLine(`${time}${id}${type} → ${data}`);
+      });
+
+      // 捕获所有自定义事件（示例：event: token / delta ...）
+      const anyEventHandler = (ev) => {
+        if (ev.type === "message" || ev.type === "open" || ev.type === "error") return;
+        const time = `<span class=\"time\">[${ts()}]</span>`;
+        const id = ev.lastEventId ? ` <span class=\"id\">#${ev.lastEventId}</span>` : "";
+        const type = ` <span class=\"evt\">${ev.type}</span>`;
+        let data = ev.data;
+        try {
+          const parsed = JSON.parse(ev.data);
+          data = `<code>${escapeHtml(JSON.stringify(parsed, null, 2))}</code>`;
+        } catch (_) {
+          data = `<code>${escapeHtml(ev.data)}</code>`;
+        }
+        printLine(`${time}${id}${type} → ${data}`);
+      };
+
+      // 常见的几个事件名做示例监听；如需更多可以自行添加
+      ["delta", "done", "token", "log", "patch"].forEach((evt) => {
+        es.addEventListener(evt, anyEventHandler);
+      });
+
+      es.addEventListener("error", (ev) => {
+        // readyState: 0 = CONNECTING, 1 = OPEN, 2 = CLOSED
+        const rs = es.readyState;
+        if (rs === EventSource.CLOSED) {
+          setState("未连接");
+          sys("✖ 连接已关闭 (CLOSED)", "err");
+        } else {
+          setState("连接中…");
+          sys("⚠ 发生错误，浏览器将自动重连 (CONNECTING)", "err");
+        }
+      });
+    }
+
+    function disconnect() {
+      if (es) {
+        try { es.close(); } catch (_) {}
+        es = null;
+      }
+      $("connect").disabled = false;
+      $("disconnect").disabled = true;
+      setState("未连接");
+      if (connectedUrl) sys(`↯ 已断开与 <span class="meta">${connectedUrl}</span> 的连接`);
+    }
+
+    function clearLog() { logEl.innerHTML = ""; }
+
+    function copyLog() {
+      const text = logEl.innerText;
+      navigator.clipboard.writeText(text).then(() => {
+        sys("日志已复制到剪贴板");
+      }).catch((e) => {
+        sys("复制失败：" + (e?.message || e), "err");
+      });
+    }
+
+    function escapeHtml(str) {
+      return str
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    $("connect").addEventListener("click", connect);
+    $("disconnect").addEventListener("click", disconnect);
+    $("clear").addEventListener("click", clearLog);
+    $("copy").addEventListener("click", copyLog);
+
+    // 快捷键：Ctrl/Cmd+Enter 连接；Ctrl/Cmd+L 清屏
+    document.addEventListener("keydown", (e) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key === "Enter") { e.preventDefault(); connect(); }
+      if (mod && (e.key.toLowerCase() === "l")) { e.preventDefault(); clearLog(); }
+    });
+  </script>
+
+  <!--
+    服务器端 SSE 响应格式示例：
+    HTTP/1.1 200 OK
+    Content-Type: text/event-stream
+    Cache-Control: no-cache
+    Connection: keep-alive
+    Access-Control-Allow-Origin: *  // 跨域需要
+
+    retry: 3000\n
+    id: 1\n
+    event: token\n
+    data: {"delta":"Hello"}\n\n
+    data: 纯文本也可以\n\n
+    // 每条消息以一个空行结束
+  -->
+</body>
+</html>
